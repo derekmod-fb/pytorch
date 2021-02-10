@@ -1,13 +1,20 @@
 from .node import Node, Argument, Target, map_arg, _type_repr, _get_qualified_name
 
-from typing import Callable, Any, List, Dict, Optional, Tuple, Set
+from typing import Callable, Any, List, Dict, Optional, Tuple, Set, FrozenSet
+from dataclasses import dataclass
 import torch
 import keyword
 import re
 import builtins
+import math
 
-def _shadows_builtin_name(name: str) -> bool:
-    return name in builtins.__dict__ or name in keyword.kwlist or name in {'inf', 'nan', 'NoneType'}
+# Mapping of builtins to their `typing` equivalent.
+_origin_type_map = {
+    list: List,
+    dict: Dict,
+    set: Set,
+    frozenset: FrozenSet
+}
 
 def _is_magic(x: str) -> bool:
     return x.startswith('__') and x.endswith('__')
@@ -29,6 +36,128 @@ def _snake_case(s: str) -> str:
         chars.append(c.lower())
         prev_lower = c.islower()
     return ''.join(chars)
+
+
+def _is_custom_torch(qualname: str) -> bool:
+    return qualname.startswith('torch.ops') or qualname.startswith('torch.classes')
+
+
+class _Globals:
+    """Tracks all external objects referenced from a Graph.
+
+    We assign each external object a unique global name, which is how it's
+    referenced in the Graph's generated Python code.
+
+    A dictionary of global name -> obj is passed to 'exec' to resolve
+    external references to their actual objects.
+    """
+    def __init__(self):
+        # The global name -> external object mapping.
+        self.globals: Dict[str, Any] = {}
+
+        # qualified name -> keys in self.globals
+        self._names: Dict[str, str] = {}
+        self._dedupe_index = 0
+
+        # Always import torch
+        self._import_strs: Set[str] = {'import torch'}
+
+        # Preload names into globals. These are objects whose `repr` returns
+        # something that actually needs to be imported to execute correctly.
+        #
+        # If you add to this, you probably need to add an import string in
+        # '_format_import_str` as well.
+        self.add_global(math.nan, 'nan')
+        self.add_global(math.inf, 'inf')
+        self.add_global(type(None), 'NoneType')
+
+    def add_global(self, obj: Any, qualname: str) -> str:
+        """Add an external obj to be tracked.
+
+        Returns the global name that should be used to reference 'obj' in
+        Python source code.
+
+        Example: 'foo.bar.baz' becomes 'foo_bar_baz'
+        """
+        if _is_custom_torch(qualname):
+            # HACK: workaround for how torch custom ops are registered. We can't
+            # import them like normal modules so they must retain their fully qualified name.
+            self._names[qualname] = qualname
+            self.globals['torch'] = torch
+            return qualname
+
+        # Check if we already added this global.
+        if qualname in self._names:
+            global_name = self._names[qualname]
+            assert self.globals[global_name] is obj
+            return global_name
+
+        global_name = qualname.replace('.', '_')
+
+        # Resolve any collisions, e.g. between 'foo._bar' and 'foo_.bar'
+        base_name = global_name
+        while global_name in self.globals:
+            global_name = f'{base_name}_{self._dedupe_index}'
+            self._dedupe_index += 1
+
+        # Populate our name tables
+        self._names[qualname] = global_name
+        self.globals[global_name] = obj
+
+        # Save the import string
+        import_str = self._format_import_str(qualname, global_name)
+        if import_str is not None:
+            self._import_strs.add(import_str)
+
+        return global_name
+
+    def format_import_block(self):
+        """Return Python source code that can be executed to import external
+        objects and assign them to the correct global names.
+
+        This is used for serializing the source code, since we can't
+        serialize the globals dict itself.
+        """
+        return '\n'.join(self._import_strs)
+
+    @staticmethod
+    def _format_import_str(qualname: str, global_name: str) -> Optional[str]:
+        """Return a snippet of source code that imports `qualname` and assigns
+        the resulting object to `global_name`."""
+        module_name, _sep, type_name = qualname.rpartition('.')
+        if len(module_name) == 0:
+            # This was a single-atom qualified name, like 'getattr', or 'len'
+            # These generally are builtins so don't need to be imported.
+            #
+            # But there are some exceptions, for objects whose `repr`
+            # returns something that actually needs to be imported to
+            # execute correctly.
+            if qualname == 'NoneType':
+                return f'{global_name} = type(None)'
+            if qualname == 'inf':
+                return f'from math import inf as {global_name}'
+            if qualname == 'nan':
+                return f'from math import nan as {global_name}'
+            return None
+
+        if _is_custom_torch(qualname):
+            # HACK: workaround for how torch custom ops are registered. We can't
+            # import them like normal modules so they must retain their fully qualified name.
+            return 'import torch'
+        else:
+            return f'from {module_name} import {type_name} as {global_name}'
+
+
+@dataclass
+class PythonCode:
+    """Represents all the information necessary to exec or save a graph as Python code."""
+    # Python source code for the forward function definition.
+    fn_src: str
+    # Values in global scope during exection of `src_def`.
+    globals: Dict[str, Any]
+    # Python source code for import statements that will recreate the `globals` dict.
+    import_block: str
+
 
 def _format_args(args: Tuple[Argument, ...], kwargs: Dict[str, Argument]) -> str:
     args_s = ', '.join(repr(a) for a in args)
@@ -129,6 +258,7 @@ class Graph:
         self._used_names : Dict[str, int] = {}  # base name -> number
         self._insert = self._root.prepend
         self._len = 0
+        self._globals = _Globals()
 
     @property
     def nodes(self) -> _node_list:
@@ -509,6 +639,13 @@ class Graph:
         op = _snake_case(op)
         return op
 
+    def _shadows_global_name(self, name: str) -> bool:
+        return (
+            name in builtins.__dict__
+            or name in keyword.kwlist
+            or name in self._globals.globals
+        )
+
     def _create_unique_name(self, candidate : str) -> str:
         # delete all characters that are illegal in a Python identifier
         candidate = re.sub('[^0-9a-zA-Z_]+', '_', candidate)
@@ -519,7 +656,7 @@ class Graph:
             return hasattr(torch, name) or \
                 hasattr(torch.nn.functional, name) or \
                 hasattr(torch.nn, name) or \
-                _shadows_builtin_name(name)
+                self._shadows_global_name(name)
 
         while candidate in self._used_names or illegal_shadowing_name(candidate):
             match = re.match(r"(.*)_(\d+)$", candidate)
@@ -532,7 +669,7 @@ class Graph:
         self._used_names.setdefault(candidate)
         return candidate
 
-    def python_code(self, root_module: str) -> str:
+    def python_code(self, root_module: str) -> PythonCode:
         """
         Turn this ``Graph`` into valid Python code.
 
@@ -546,28 +683,26 @@ class Graph:
             The string source code generated from this ``Graph``.
         """
         free_vars: List[str] = []
-        modules_used : Set[str] = set()
         body: List[str] = []
+        self._globals = _Globals()
 
         # Wrap string in list to pass by reference
         maybe_return_annotation : List[str] = ['']
 
-        def register_modules_used(qualified_name : str):
-            if '.' in qualified_name:
-                module_name = qualified_name.split('.', maxsplit=1)[0]
-                modules_used.add(module_name)
-
         def type_repr(o : Any):
             typename = _type_repr(o)
+
+            # Common case: this is a regular module name like 'foo.bar.baz'
             if all(x.isidentifier() for x in typename.split('.')):
-                register_modules_used(typename)
-            else:
-                # this is a constructor type, e.g. typing.List[torch.Tensor]
-                modules_used.add(o.__module__)
-                for sub_type in o.__args__:
-                    # make sure we have torch.Tensor
-                    type_repr(sub_type)
-            return typename
+                return self._globals.add_global(o, typename)
+
+            # This is a generic type, e.g. typing.List[torch.Tensor]
+            origin_type = _origin_type_map.get(o.__origin__, o.__origin__)
+            origin_typename = self._globals.add_global(origin_type, _type_repr(origin_type))
+
+            # Assign global names for each of the inner type variables.
+            args = [type_repr(arg) for arg in o.__args__]
+            return f'{origin_typename}[{",".join(args)}]'
 
 
         # Run through reverse nodes and record the first instance of a use
@@ -628,15 +763,15 @@ class Graph:
                     body.append(f'{node.name} = {magic_methods[node.target.__name__].format(*(repr(a) for a in node.args))}')
                     return
                 qualified_name = _get_qualified_name(node.target)
-                register_modules_used(qualified_name)
-                if qualified_name == 'getattr' and \
+                global_name = self._globals.add_global(node.target, qualified_name)
+                if global_name == 'getattr' and \
                    isinstance(node.args, tuple) and \
                    isinstance(node.args[1], str) and \
                    node.args[1].isidentifier():
                     # pretty print attribute access
                     body.append(f'{node.name} = {_format_target(repr(node.args[0]), node.args[1])}')
                     return
-                body.append(f'{node.name} = {qualified_name}({_format_args(node.args, node.kwargs)})')
+                body.append(f'{node.name} = {global_name}({_format_args(node.args, node.kwargs)})')
                 return
             elif node.op == 'call_module':
                 assert isinstance(node.target, str)
@@ -661,8 +796,6 @@ class Graph:
 
         # repr() for inf and nan floating point values aren't parseable by
         # python as literals. Explicitly import the names from the ``math`` module.
-        import_strs = [f'import {name}' for name in sorted(modules_used)]
-        import_block = '\n'.join(import_strs)
 
         if len(body) == 0:
             # If the Graph has no non-placeholder nodes, no lines for the body
@@ -672,12 +805,13 @@ class Graph:
 
         code = ''.join(body)
         code = '\n'.join('    ' + line for line in code.split('\n'))
-        fn_code = f"""\
-{import_block}
+        fn_code = f"""
 def forward(self, {', '.join(free_vars)}){maybe_return_annotation[0]}:
 {code}"""
 
-        return fn_code
+        return PythonCode(fn_code,
+                          self._globals.globals.copy(),
+                          self._globals.format_import_block())
 
     def __str__(self) -> str:
         """
